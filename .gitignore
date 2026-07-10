@@ -1,0 +1,16 @@
+# Secrets — never commit
+credentials.json
+
+# Generated output / logs
+output_results.xlsx
+scan.log
+cmp_debug.log
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# OS
+.DS_Store
