@@ -1,155 +1,115 @@
-# Async CMP Compliance Scanner
+# CMP Compliance Scanner
 
-A concurrent Python tool that uses **Playwright** to crawl a list of websites, detect which Consent Management Platform (CMP) each one runs (OneTrust, Cookiebot, TrustArc, Didomi, etc.), and log the results to a live Google Sheet as well as a local Excel backup.
+Crawls a list of websites and reports, per site:
 
----
+- whether a cookie/consent banner is present, and which CMP (Consent
+  Management Platform) is running it
+- the site's privacy policy link, who actually hosts it, and whether the
+  entity named in the policy text plausibly matches the site itself
 
-## How it works
-
-The crawler runs on `asyncio`. Instead of blocking on slow page loads or network requests, it spins up multiple browser workers concurrently, capped by a semaphore so you don't exhaust memory or get rate-limited.
-
-```
-                  +-------------------+
-                  |  input_urls.xlsx  |
-                  +---------+---------+
-                            |
-                            v
-                  +---------+---------+
-                  |    MainCrawler    |
-                  +---------+---------+
-                            |
-        (Semaphore limits concurrency to 5)
-                            |
-        +-------------------+-------------------+
-        |                   |                   |
-        v                   v                   v
-  +-----------+       +-----------+       +-----------+
-  | Worker 1  |       | Worker 2  |       | Worker 3  |
-  | (browser) |       | (browser) |       | (browser) |
-  +-----+-----+       +-----+-----+       +-----+-----+
-        |                   |                   |
-        +-------------------+-------------------+
-                            |
-              +-------------+-------------+
-              |                           |
-              v                           v
-      +---------------+           +---------------+
-      | Cloud stream  |           | Local backup  |
-      | (gspread API) |           | (pandas)      |
-      +-------+-------+           +-------+-------+
-              |                           |
-              v                           v
-      +---------------+           +---------------+
-      | Google Sheets |           | output_results|
-      +---------------+           +---------------+
-```
-
-### Detection logic
-
-For each page, the scanner checks four signal types to identify a CMP:
-
-1. DOM element **IDs**
-2. **CSS classes**
-3. Injected **script sources**
-4. Global **`window` variables**
-
-If none of the known signatures match, a fallback heuristic scans for common consent-related keywords to flag likely custom or unrecognized banners.
-
----
+Built to run over lists in the thousands without babysitting: it streams
+results to disk as it goes, skips URLs it already finished on a rerun, and
+recycles its browser periodically so memory doesn't creep up over a long run.
 
 ## Setup
 
-Requires Python 3.9+.
-
-### 1. Install dependencies
+```powershell
+(Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned) ; (& d:\codes\cmp-scanner\venv\Scripts\Activate.ps1)
+```
 
 ```bash
-cd ccm-scanner-pipeline
-
-python -m venv venv
-
-# macOS/Linux
-source venv/bin/activate
-# Windows (cmd)
-venv\Scripts\activate.bat
-# Windows (PowerShell)
-.\venv\Scripts\Activate.ps1
-
-pip install playwright pandas openpyxl gspread google-auth
+pip install -r requirements.txt --break-system-packages   # or use a venv
 playwright install chromium
 ```
 
-### 2. Prepare the input file
-
-Create `input_urls.xlsx` in the project root with a single column named `Website URL`:
-
-| Website URL            |
-| ---------------------- |
-| https://www.amazon.com |
-| https://www.ibm.com    |
-| https://www.didomi.io  |
-
----
-
-## Google Sheets integration (optional)
-
-To stream live results to a Google Sheet, you'll need a service account.
-
-**1. Create a Google Cloud project**
-
-- Go to the [Google Cloud Console](https://console.cloud.google.com/)
-- Create a new project (e.g. `CMP-Data-Compliance-Auditor`)
-
-**2. Enable the required APIs**
-
-- Enable the **Google Sheets API**
-- Enable the **Google Drive API**
-
-**3. Create a service account**
-
-- Go to **APIs & Services → Credentials → Create Credentials → Service Account**
-- Give it a name (e.g. `crawler-agent`)
-- Grant it the **Editor** role
-
-**4. Download the credentials**
-
-- Open the service account, go to **Keys → Add Key → Create new key**
-- Choose **JSON** and download it
-- Move the downloaded file into your project directory and rename it to `credentials.json`
-
-**5. Share your sheet with the service account**
-
-- Create a Google Sheet named exactly `Crawler Dashboard`
-- Open `credentials.json` and copy the `client_email` value (ends in `.gserviceaccount.com`)
-- In the Sheet, click **Share**, paste that email, give it **Editor** access, uncheck "Notify people," and share
-
-> **Note:** If the service account email isn't added to the sheet, you'll get `APIError [403]: PERMISSION_DENIED`. The scanner catches this automatically and falls back to writing results locally to `output_results.xlsx` instead of crashing.
-
----
-
-## Running it
+Put your URLs in `input_urls.xlsx` (any of these work: a column named
+`Website URL` / `URL` / `Website` / `Domain` / `Site` — case/space
+insensitive — or just a single column of bare domains with no header at
+all). Optionally drop a `credentials.json` service-account file next to
+`main.py` to also mirror results into a Google Sheet; if it's missing the
+scanner logs a warning and continues with CSV/Excel output only.
 
 ```bash
 python main.py
 ```
 
-### Output files
+## File layout
 
-| File                                       | Description                                                            |
-| ------------------------------------------ | ---------------------------------------------------------------------- |
-| **Crawler Dashboard** (Google Sheet) | Live results, updated as each site finishes scanning                   |
-| **output_results.xlsx**              | Local backup written at the end of the run                             |
-| **scan.log**                         | Runtime log: concurrency, timeouts, access errors, timing              |
-| **cmp_debug.log**                    | Detailed log of every matched ID, class, script, and variable per site |
+| File                  | Responsibility                                                                                       |
+|------------------------|-------------------------------------------------------------------------------------------------------|
+| `config.py`            | All tunables in one place: paths, concurrency/timeouts, the CMP signature registry, regex patterns    |
+| `models.py`            | Typed result shapes (`ScanResult`, `CmpEvidence`, `PolicyEvidence`) shared across modules              |
+| `utils.py`             | Small stateless helpers: domain parsing, owner-name normalization/matching, logging setup             |
+| `banner_detector.py`   | Pulls raw signals (DOM ids/classes, script sources, window globals) off a live page — no CMP logic     |
+| `cmp_identifier.py`    | Matches those signals against `config.CmpRegistry` to name the CMP, in ids → classes → scripts → globals priority |
+| `privacy_policy.py`    | Finds the privacy policy link, inspects who hosts it, and extracts/validates the named owner            |
+| `browser_manager.py`   | Owns the shared Chromium instance; recycles it every N scans to bound memory growth                    |
+| `scanner.py`           | Scans one site end to end, with a retry on timeout/failure                                              |
+| `excel_handler.py`     | Input loading (header-quirk tolerant), streaming CSV writer with resume support, Google Sheets setup    |
+| `main.py`              | Entry point — wires the above together and runs the batch                                               |
 
----
+## CMP signature registry
 
-## Code structure
+Every signature in `config.CmpRegistry` is sourced from vendor documentation
+or real implementation snippets — nothing is guessed, and a page that
+matches nothing in the registry is reported as `Unknown`, never assigned a
+best-guess vendor. Currently covers: **OneTrust**, **TrustArc**, Cookiebot,
+Didomi, Usercentrics, Osano, Sourcepoint, Quantcast Choice, CookieYes, a
+generic IAB TCF v2 fallback (`__tcfapi`) for any TCF-compliant CMP that
+doesn't match a specific vendor, plus two site-specific globals (Microsoft's
+`mscc`, Amazon's `sp-cc`) confirmed from real scans. OneTrust and TrustArc
+carry the deepest coverage (12-15 signatures each across ids/classes/
+scripts/globals) since they're the two most commonly encountered.
 
-| Function                                                       | Purpose                                                                                                                                    |
-| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `GetWebsiteName(url)`                                        | Extracts a clean domain name from a URL (strips`www.`, query params, etc.) for readable reports                                          |
-| `AppendToDebugLog(entry)`                                    | Writes detailed match data to`cmp_debug.log` without cluttering the main dashboard                                                       |
-| `AnalyzePageEvidence(page, url)`                             | Core detection logic — injects JS into the page to collect DOM/script/variable evidence and matches it against the CMP signature registry |
-| `ScanSingleWebsite(browser, url, semaphore, dashboard)`      | Manages a single browser tab's lifecycle; wraps everything in try/except so one slow or broken site doesn't stall the whole run            |
-| `MainCrawler(input_path, output_path, max_concurrent_sites)` | Orchestrates the whole run: reads input, authenticates with Google, launches workers, and writes final output                              |
+If none of the known signatures match, a fallback heuristic scans for
+generic consent-related keywords (`cookie`, `consent`, etc.) in element ids
+to flag likely custom/unrecognized banners.
+
+## Privacy policy check
+
+For every site, the scanner finds the in-page privacy policy/notice link,
+opens it, and reports:
+
+- **Privacy Policy URL** — the final URL after redirects
+- **Privacy Policy Host** — the domain actually serving it
+- **Third-Party Hosted Policy** — flagged when it's served from a known
+  vendor domain (OneTrust Privacy Portal, TrustArc, iubenda, Termly,
+  PrivacyPolicies.com, CookieYes, etc.) instead of the site's own domain
+- **Detected Policy Owner** — the entity named in the policy, found via (in
+  order) `og:site_name`/`application-name` meta tags, a copyright/footer
+  line checked at both the top and bottom of the page, or the `<title>` tag
+- **Owner Matches Site** — `Yes` / `No (verify manually)` / `Unknown`,
+  comparing the detected owner against the site's own domain. A `No` is a
+  useful signal on its own — a subsidiary, an un-customized template, or a
+  policy that names a different entity than the site itself.
+
+## Designed for 10K-site runs
+
+- **Streaming, resumable output.** Results are written to
+  `output_results.csv` one row at a time as each site finishes, not held in
+  memory until the end. Rerunning `python main.py` on the same input skips
+  any URL already recorded with `Status/Error = Success`, so an interrupted
+  10,000-site run can just be restarted.
+- **Bounded concurrency with a fast early-exit wait.** `MAX_CONCURRENT_SITES`
+  (default 15) browser tabs run at once. Instead of a flat fixed sleep per
+  site, the scanner waits for any known CMP banner selector to appear (up to
+  `BANNER_WAIT_TIMEOUT_MS`), exiting early the moment it shows up rather than
+  always waiting the full timeout.
+- **Browser recycling.** The shared Chromium instance is closed and relaunched
+  every `BROWSER_RECYCLE_EVERY` scans (default 300) so memory doesn't creep
+  up over a multi-hour run.
+- **Retry on transient failure.** A timed-out or failed scan gets one retry
+  with a longer timeout before being recorded as an error — a meaningful
+  fraction of failures at this scale are just network hiccups, not broken
+  sites.
+- **A final `output_results.xlsx`** is built from the CSV once the run
+  finishes, for convenience in Excel/Sheets.
+
+## Known limitation: geo-gated banners
+
+Consent banners are frequently shown or hidden based on the crawler's real
+IP-based geolocation, not request headers — a site that's fully GDPR-gated
+for EU visitors may load its CMP script but never render/trigger anything
+for a non-EU crawler IP. A `Cookie Banner Available = No` result means no
+known CMP signature was found on the page as loaded from wherever the
+scanner is running, not necessarily that the site has no CMP at all.
