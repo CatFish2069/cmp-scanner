@@ -14,7 +14,16 @@ recycles its browser periodically so memory doesn't creep up over a long run.
 ## Setup
 
 ```powershell
-(Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned) ; (& d:\codes\cmp-scanner\venv\Scripts\Activate.ps1)
+# Windows PowerShell — create and activate a virtual environment
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+```
+
+```bash
+# macOS/Linux
+python3 -m venv venv
+source venv/bin/activate
 ```
 
 ```bash
@@ -22,12 +31,21 @@ pip install -r requirements.txt --break-system-packages   # or use a venv
 playwright install chromium
 ```
 
-Put your URLs in `input_urls.xlsx` (any of these work: a column named
-`Website URL` / `URL` / `Website` / `Domain` / `Site` — case/space
-insensitive — or just a single column of bare domains with no header at
-all). Optionally drop a `credentials.json` service-account file next to
-`main.py` to also mirror results into a Google Sheet; if it's missing the
-scanner logs a warning and continues with CSV/Excel output only.
+Put your URLs in `input_urls.csv` or `input_urls.xlsx` (whichever you have —
+the scanner checks for a CSV first, then Excel; you can also pass an explicit
+path as `python main.py path/to/file.csv`). Either format accepts a column
+named `Website URL` / `URL` / `Website` / `Domain` / `Site` (case/space
+insensitive), or just a single column of bare domains with no header at
+all. Duplicate rows (same domain, different `www.`/scheme formatting) are
+detected and skipped automatically before scanning starts. Optionally drop a `credentials.json` service-account file next to
+`main.py` (see `credentials.example.json` for the expected shape) to also
+mirror results into a Google Sheet named `Crawler Dashboard`; if it's
+missing the scanner logs a warning and continues with CSV/Excel output
+only. The service account needs both the Sheets and Drive API scopes
+enabled (Drive is required just to look the spreadsheet up by name), and
+the sheet itself must be shared with the service account's `client_email`
+address. **Never commit your real `credentials.json`** — it's already
+covered by `.gitignore`.
 
 ```bash
 python main.py
@@ -95,13 +113,24 @@ opens it, and reports:
   site, the scanner waits for any known CMP banner selector to appear (up to
   `BANNER_WAIT_TIMEOUT_MS`), exiting early the moment it shows up rather than
   always waiting the full timeout.
-- **Browser recycling.** The shared Chromium instance is closed and relaunched
-  every `BROWSER_RECYCLE_EVERY` scans (default 300) so memory doesn't creep
-  up over a multi-hour run.
+- **Browser recycling that doesn't race concurrent scans.** The shared
+  Chromium instance is relaunched every `BROWSER_RECYCLE_EVERY` scans
+  (default 300) to bound memory growth. New scans switch to the fresh
+  instance immediately; the retired one keeps serving whatever contexts it
+  already handed out and only closes itself once they've all finished —
+  never mid-operation.
+- **Self-healing on a dead browser/driver.** If Chromium (or the whole
+  Playwright driver process) crashes outright, the next scan attempt
+  detects the dead connection and transparently relaunches everything
+  instead of every subsequent site failing in a cascade.
 - **Retry on transient failure.** A timed-out or failed scan gets one retry
   with a longer timeout before being recorded as an error — a meaningful
   fraction of failures at this scale are just network hiccups, not broken
   sites.
+- **Clean interruption.** Ctrl+C exits with a plain "progress is saved,
+  rerun to resume" message instead of a raw traceback, and known-benign
+  Windows shutdown noise (proactor socket warnings from killing Chromium's
+  pipes mid-interrupt) is suppressed rather than left to clutter the log.
 - **A final `output_results.xlsx`** is built from the CSV once the run
   finishes, for convenience in Excel/Sheets.
 
